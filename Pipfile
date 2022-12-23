@@ -1,0 +1,11 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+pillow = "~=7.2"
+"rpi.gpio" = "~=0.6"
+picamera = "~=1.13"
+
+[dev-packages]

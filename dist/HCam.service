@@ -1,0 +1,11 @@
+[Unit]
+Description=HCam software
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/shack-photobooth
+ExecStart=/home/pi/.local/bin/pipenv run python3 /home/pi/shack-photobooth/Hcam.py
+
+[Install]
+WantedBy=multi-user.target

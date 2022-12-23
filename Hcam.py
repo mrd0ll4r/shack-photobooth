@@ -6,7 +6,6 @@ import RPi.GPIO as GPIO
 import threading
 from collections import deque
 from time import sleep
-from subprocess import check_output
 from datetime import datetime
 import _thread
 import picamera
@@ -36,6 +35,7 @@ class NoIRFixedPiCamera(picamera.PiCamera):
 
 
 PRINT_ENABLED = True
+REMOVE_TEMP_FILES = True
 
 """ Printer properties """
 PRINTER_WIDTH = 640
@@ -70,15 +70,11 @@ PIN_BULBS = 2
 PINS_LED = [PIN_LED1, PIN_LED2, PIN_LED3, PIN_LED4, PIN_LED5, PIN_LED6]
 
 """ Directory and file paths. """
-FOLDER_RESULTS = "/home/pi/Pictures/"
-FOLDER = "/home/pi/HCam/"
-FOLDER_TEMP = "/home/pi/HCam/temp/"
-FILE_WATERMARK_PRINT = FOLDER + "logo_U_print.png"
-FILE_GROUPLINK_PRINT = FOLDER + "link_overlay_print.png"
-FILE_COLORSCALE_PRINT = FOLDER + "colorscale.gif"
-FILE_WATERMARK_BIG = FOLDER + "logo_big.png"
-FILE_PRINT = FOLDER_TEMP + "print.png"
-FILE_TEMP_BIG = FOLDER_TEMP + "temp.png"
+DIR_RESULTS = "/home/pi/Pictures/"
+DIR_TMP = "./tmp/"
+
+# Colorscale for printing. This is generated on the fly.
+FILE_COLORSCALE_PRINT = "colorscale.gif"
 
 """ A lock used to synchronize access to the status LEDs. """
 LED_lock = _thread.allocate_lock()
@@ -182,7 +178,7 @@ class WorkingIndicator(threading.Thread):
         self.stop_request.set()
 
 
-def print_image_file(filename):
+def print_image_file(filename: str):
     print("printing file " + filename)
 
     # Something somewhere hangs/is unfinished, probably some unterminated garbage at the end of a print via USB.
@@ -199,12 +195,97 @@ def print_image_file(filename):
             print("waiting for previous print to finish (/dev/usb/lp0 unavailable or not writeable)")
             sleep(.5)
 
-    subprocess.run(["lpr", filename])
+    subprocess.run(["lpr", filename], check=True)
 
 
-def record_photo(filename):  # takes 4 photos at different lighting conditions
-    print("recording " + filename)
+class RecordedPhotos:
+    timestamp = None
+    no_lights_path = None
+    tubes_path = None
+    tubes_bulbs_path = None
+    bulbs_path = None
 
+    @staticmethod
+    def tmp_jpeg_with_suffix(timestamp: str, suffix: str):
+        return os.path.join(DIR_TMP, "{}_{}.jpg".format(timestamp, suffix))
+
+    def __init__(self, timestamp: str):
+        self.timestamp = timestamp
+        self.no_lights_path = self.tmp_jpeg_with_suffix(timestamp, "no_lights")
+        self.tubes_path = self.tmp_jpeg_with_suffix(timestamp, "tubes")
+        self.tubes_bulbs_path = self.tmp_jpeg_with_suffix(timestamp, "tubes_bulbs")
+        self.bulbs_path = self.tmp_jpeg_with_suffix(timestamp, "bulbs")
+
+    def __del__(self):
+        if REMOVE_TEMP_FILES:
+            os.remove(self.no_lights_path)
+            os.remove(self.tubes_path)
+            os.remove(self.tubes_bulbs_path)
+            os.remove(self.bulbs_path)
+
+
+class OutputImages:
+    FILE_TEMP_BIG = os.path.join(DIR_TMP, "temp_big.png")
+    FILE_BIG_WATERMARK = "logo_big.png"
+
+    timestamp = None
+    no_lights_path = None
+    flash_path = None
+    social_media_path = None
+    recorded_photos = None
+
+    @staticmethod
+    def result_filename(timestamp: str, suffix: str = None):
+        if suffix is not None:
+            return os.path.join(DIR_RESULTS, "{}_{}.jpg".format(timestamp, suffix))
+        return os.path.join(DIR_RESULTS, "{}.jpg".format(timestamp))
+
+    def __init__(self, recorded_photos: RecordedPhotos):
+        self.timestamp = recorded_photos.timestamp
+        self.recorded_photos = recorded_photos
+        self.no_lights_path = self.result_filename(self.timestamp)
+        self.flash_path = self.result_filename(self.timestamp, "flash")
+        self.social_media_path = self.result_filename(self.timestamp, "social_media")
+
+    @staticmethod
+    def composite_with_watermark(input_path: str, output_path: str):
+        subprocess.run(["convert", "-composite", input_path, OutputImages.FILE_BIG_WATERMARK, output_path], check=True)
+
+    def process(self):
+        subprocess.run(
+            ["convert", self.recorded_photos.no_lights_path, "-auto-level", "-auto-gamma", "-unsharp", "2",
+             OutputImages.FILE_TEMP_BIG], check=True)
+        self.composite_with_watermark(OutputImages.FILE_TEMP_BIG, self.no_lights_path)
+
+        subprocess.run(
+            ["convert", self.recorded_photos.bulbs_path, "-auto-level", "-auto-gamma", "-unsharp", "2",
+             OutputImages.FILE_TEMP_BIG],
+            check=True)
+        # Alternatively
+        # subprocess.run(
+        #    ["convert", self.recorded_photos.bulbs_path, "-normalize", "-adaptive-sharpen", "0x3", "-modulate", "100,70",
+        #     OutputImages.FILE_TEMP_BIG],check=True)
+        self.composite_with_watermark(OutputImages.FILE_TEMP_BIG, self.flash_path)
+
+        subprocess.run(
+            ["convert", self.recorded_photos.tubes_bulbs_path, "-normalize", "-adaptive-sharpen", "0x10", "-modulate",
+             "100,130",
+             OutputImages.FILE_TEMP_BIG], check=True)
+        self.composite_with_watermark(OutputImages.FILE_TEMP_BIG, self.social_media_path)
+
+
+def record_photos(camera: picamera.PiCamera, timestamp: str) -> RecordedPhotos:
+    """
+    Takes four photos at different lighting conditions.
+    Parameters are paths to jpeg files.
+    """
+
+    photo_paths = RecordedPhotos(timestamp)
+
+    # We're using camera.capture.
+    # videoport might increase speed but implies a smaller viewing angle
+
+    print("recording photos")
     progress = LoadingIndicator(1.6)
     progress.start()
 
@@ -212,33 +293,41 @@ def record_photo(filename):  # takes 4 photos at different lighting conditions
 
     camera.start_preview()
 
-    sleep(.5)  # pause to let the camera adjust
-    camera.capture(filename + "_1.jpg")  # videoport might increase speed but implies a smaller viewing angle
+    # pause to let the camera adjust
+    sleep(.5)
+    camera.capture(photo_paths.no_lights_path)
 
-    GPIO.output(PIN_TUBES, 1)  # turn on tubes
+    # turn on tubes
+    GPIO.output(PIN_TUBES, 1)
 
     sleep(.5)
-    camera.capture(filename + "_2.jpg")
+    camera.capture(photo_paths.tubes_path)
 
-    GPIO.output(PIN_BULBS, 1)  # turn on bulbs
+    # turn on bulbs
+    GPIO.output(PIN_BULBS, 1)
 
-    sleep(1)  # pause to let the camera adjust and heat up the bulbs
-    camera.capture(filename + "_3.jpg")
+    # longer pause to let the camera adjust and heat up the bulbs
+    sleep(1)
+    camera.capture(photo_paths.tubes_bulbs_path)
 
-    GPIO.output(PIN_TUBES, 0)  # turn off tubes
+    # turn off tubes
+    GPIO.output(PIN_TUBES, 0)
 
     sleep(.5)
-    camera.capture(filename + "_4.jpg")
+    camera.capture(photo_paths.bulbs_path)
 
-    GPIO.output(PIN_BULBS, 0)  # turn off bulbs
+    # turn off bulbs
+    GPIO.output(PIN_BULBS, 0)
 
     camera.stop_preview()
 
-    print("finished " + filename)
+    print("finished recording photos")
     progress.stop()
 
+    return photo_paths
 
-def record_video(filename):
+
+def record_video(camera, filename):
     progress = LoadingIndicator(2)
     progress.start()
 
@@ -266,7 +355,7 @@ def setup_gpio():
     GPIO.add_event_detect(PIN_VIDEO, GPIO.FALLING, bouncetime=1000)
 
 
-def setup_camera():
+def setup_camera() -> NoIRFixedPiCamera:
     camera = NoIRFixedPiCamera()
     camera.rotation = 0
     camera.framerate = VIDEO_FRAMERATE
@@ -279,102 +368,123 @@ def setup_camera():
 
 
 def setup_colorscale():
-    subprocess.run(["convert", "xc:gray10", "xc:gray90", "+append", FILE_COLORSCALE_PRINT])
+    subprocess.run(["convert", "xc:gray10", "xc:gray90", "+append", FILE_COLORSCALE_PRINT], check=True)
 
 
-def prepare_print_file(print_input_file):
+def prepare_print_file_inner(input_image_path: str, output_image_path: str, pre_grayscale_composite_paths: [str],
+                             post_grayscale_composite_paths: [str]):
     subprocess.run(
-        ["convert", print_input_file, "-resize", PRINTER_SIZE_STR, "-auto-gamma", "-brightness-contrast",
-         "20x10", FILE_PRINT])
-    subprocess.run(["convert", "-composite", FILE_PRINT, FILE_WATERMARK_PRINT, FILE_PRINT])
-    subprocess.run(["convert", FILE_PRINT, "-remap", FILE_COLORSCALE_PRINT, FILE_PRINT])
-    subprocess.run(["convert", "-composite", FILE_PRINT, FILE_GROUPLINK_PRINT, FILE_PRINT])
+        ["convert", input_image_path, "-resize", PRINTER_SIZE_STR, "-auto-gamma", "-brightness-contrast",
+         "20x10", output_image_path], check=True)
+    for watermark in pre_grayscale_composite_paths:
+        subprocess.run(["convert", "-composite", output_image_path, watermark, output_image_path], check=True)
+
+    subprocess.run(["convert", output_image_path, "-remap", FILE_COLORSCALE_PRINT, output_image_path], check=True)
+
+    for watermark in post_grayscale_composite_paths:
+        subprocess.run(["convert", "-composite", output_image_path, watermark, output_image_path], check=True)
+
+    # TODO add some text below, like this:
+    # Create text image:
+    # convert -font DejaVu-Sans-Mono -pointsize 38 -size 374x182 label:"$(date '+%d.%m.%Y %H:%M')" -bordercolor white -border 5 timestamp.png
+    # Make print larger (wider):
+    # convert print.png -background white -gravity west -extent 832x384 print-extended.png
+    # Copy the timestamp into the extended print image:
+    # convert print-extended.png timestamp.png -gravity east -composite print-final.png
 
 
-setup_gpio()
+def prepare_print_file(recorded_photos: RecordedPhotos) -> str:
+    print_file_path = os.path.join(DIR_TMP, "print.png")
+    file_watermark_print = "logo_U_print.png"
+    file_group_link_print = "link_overlay_print.png"
 
-# indicate startup process
-indicator = WorkingIndicator()
-indicator.start()
+    # We print the first image (without lighting) because it looks best at night (as determined through trial and
+    # error). During daytime the images with bulbs look better, but we don't optimize for that case :)
+    photo_for_print = recorded_photos.no_lights_path
 
-# get IP adress
-hostIP = check_output(['hostname', '-I'])
-print(hostIP)
+    prepare_print_file_inner(photo_for_print, print_file_path, [file_watermark_print], [file_group_link_print])
+    # TODO print date, maybe a funny quote.
+    # Maybe tommy cash lyrics?
 
-# Create camera and in-memory stream
-camera = setup_camera()
-
-setup_colorscale()
-
-indicator.stop()
-
-indicate_standby()  # waits for the LED lock, so effectively for progress to actually stop
-
-try:
-
-    print("entering main loop")
-    # Main loop
-    while True:
-
-        sleep(.2)
-
-        if GPIO.event_detected(PIN_FOOTSWITCH):
-            # we just want to test the footswitch...
-            print("footswitch pressed")
-            indicate_triangle_right()
-            sleep(.5)
-            indicate_standby()
-
-        if GPIO.event_detected(PIN_VIDEO):
-            # we just want to test the video button...
-            print("video pressed")
-            indicate_triangle_left()
-            sleep(.5)
-            indicate_standby()
-
-        # take a picture   
-        if GPIO.event_detected(PIN_PHOTO):
-            now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            photo_basename = FOLDER_TEMP + now
-
-            photo_for_result = photo_basename + "_1.jpg"
-            photo_for_result_flash = photo_basename + "_4.jpg"
-            result_filename = FOLDER_RESULTS + now + ".png"
-            result_filename_flash = FOLDER_RESULTS + now + "_flash.png"
-            record_photo(photo_basename)  # produce 4 numbered fotos on disk. This has its own progress indicator.
-
-            indicator = WorkingIndicator()
-            indicator.start()
-
-            os.chdir(FOLDER_TEMP)
-
-            if PRINT_ENABLED:
-                # We print the first image because it looks best at night (as determined through trial and error).
-                # During daytime images 3 and 4 look better, but we don't optimize for that case :)
-
-                print_input_file = "{}_1.jpg".format(now)
-                prepare_print_file(print_input_file)
-                print_image_file(FILE_PRINT)
-
-            # postprocess the high quality saved image (takes long)
-            print("postprocessing saved image file...")
-
-            subprocess.run(["convert", photo_for_result, "-auto-level", "-auto-gamma", "-unsharp", "2", FILE_TEMP_BIG])
-            subprocess.run(["convert", "-composite", FILE_TEMP_BIG, FILE_WATERMARK_BIG, result_filename])
-
-            subprocess.run(
-                ["convert", photo_for_result_flash, "-auto-level", "-auto-gamma", "-unsharp", "2", FILE_TEMP_BIG])
-            subprocess.run(["convert", "-composite", FILE_TEMP_BIG, FILE_WATERMARK_BIG, result_filename_flash])
-
-            # make sure the result is readable even if the program runs as a different user
-            # os.system("chown pi:users " + result_filename)
-            # os.system("chown pi:users " + result_filename_flash)
-
-            print("done processing image")
-            indicator.stop()
-            indicate_standby()
+    return print_file_path
 
 
-except KeyboardInterrupt:
-    print("Main loop has exited")
-    GPIO.cleanup()
+def process_output_files(recorded_photos: RecordedPhotos) -> OutputImages:
+    output_images = OutputImages(recorded_photos)
+
+    print("processing output images")
+    output_images.process()
+
+    return output_images
+
+
+def main():
+    setup_gpio()
+
+    # indicate startup process
+    indicator = WorkingIndicator()
+    indicator.start()
+
+    # Create camera and in-memory stream
+    camera = setup_camera()
+
+    setup_colorscale()
+
+    indicator.stop()
+
+    indicate_standby()  # waits for the LED lock, so effectively for progress to actually stop
+
+    try:
+
+        print("entering main loop")
+        # Main loop
+        while True:
+
+            sleep(.2)
+
+            if GPIO.event_detected(PIN_FOOTSWITCH):
+                # we just want to test the footswitch...
+                print("footswitch pressed")
+                indicate_triangle_right()
+                sleep(.5)
+                indicate_standby()
+
+            if GPIO.event_detected(PIN_VIDEO):
+                # we just want to test the video button...
+                print("video pressed")
+                indicate_triangle_left()
+                sleep(.5)
+                indicate_standby()
+
+            if GPIO.event_detected(PIN_PHOTO):
+                # take a picture
+                ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+                # Record photos. This has its own progress indicator.
+                recorded_photos = record_photos(camera, ts)
+
+                indicator = WorkingIndicator()
+                indicator.start()
+
+                if PRINT_ENABLED:
+                    file_to_print = prepare_print_file(recorded_photos)
+
+                    print_image_file(file_to_print)
+
+                # postprocess the high quality saved image (takes long)
+                print("postprocessing saved image file...")
+
+                process_output_files(recorded_photos)
+
+                print("done processing image")
+
+                indicator.stop()
+                indicate_standby()
+
+    except KeyboardInterrupt:
+        print("Main loop exiting")
+        GPIO.cleanup()
+
+
+if __name__ == "__main__":
+    main()
